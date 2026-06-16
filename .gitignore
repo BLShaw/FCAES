@@ -1,0 +1,39 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+.venv/
+env/
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# scripts
+create_mock_pdf.py
+
+# Datasets and Media
+*.mp4
+data/
+
+# Docs
+internaldocs/*
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Extracted Datasets (Images)
+datasets/
+
+# Outputs
+outputs/yolo_classifier/*
+!outputs/yolo_classifier/weights/
+outputs/yolo_classifier/weights/*
+!outputs/yolo_classifier/weights/*.pt
+outputs/detections.json
