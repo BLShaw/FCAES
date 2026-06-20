@@ -15,12 +15,10 @@ env/
 *.swp
 *.swo
 
-# scripts
-create_mock_pdf.py
-
 # Datasets and Media
 *.mp4
-data/
+!data/data/*.mp4
+data/.cache/
 
 # Docs
 internaldocs/*
@@ -30,6 +28,8 @@ internaldocs/*
 
 # Extracted Datasets (Images)
 datasets/
+data/data/*
+
 
 # Outputs
 outputs/yolo_classifier/*
@@ -37,3 +37,8 @@ outputs/yolo_classifier/*
 outputs/yolo_classifier/weights/*
 !outputs/yolo_classifier/weights/*.pt
 outputs/detections.json
+outputs/categorized_detections.json
+outputs/database.jsonl
+outputs/policy_schema.json
+outputs/shift_summary.md
+yolov8n.pt
