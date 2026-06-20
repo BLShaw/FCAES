@@ -11,7 +11,7 @@ class VisionPipeline:
             
         # 1. Base Object Detector (Pre-trained) for Action Tracking
         self.detector = YOLO("yolov8n.pt")
-        # 2. Custom Classifier (Fine-tuned on Voxel51) for State Checking
+        # 2. Custom Classifier for State Checking
         self.classifier = YOLO(classifier_weights)
         
         # Static OpenCV Zones (Example coordinates for a 1920x1080 fixed camera)
@@ -28,7 +28,7 @@ class VisionPipeline:
         return {}
 
     def is_inside_polygon(self, center_x: int, center_y: int, zone_points: List) -> bool:
-        # Mock point polygon test
+        # Point polygon test
         x_min = min(p[0] for p in zone_points)
         x_max = max(p[0] for p in zone_points)
         y_min = min(p[1] for p in zone_points)
@@ -43,9 +43,25 @@ class VisionPipeline:
 
     def process_video(self, video_path: str) -> List[Dict[str, Any]]:
         cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"Error: Could not open video at path {video_path}")
+            return []
+            
+        clip_id = Path(video_path).stem
+        
+        # Initialize VideoWriter
+        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        out_path = f"outputs/annotated_{clip_id}.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*'avc1')
+        out_writer = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+        
         records = []
         frame_idx = 0
-        clip_id = Path(video_path).stem
+        
+        # State for smoothing annotations between processed frames
+        current_annotations = []
         
         while cap.isOpened():
             ret, frame = cap.read()
@@ -54,76 +70,123 @@ class VisionPipeline:
                 
             timestamp = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
             
-            # Detect base objects (person=0, forklift/truck=7)
-            results = self.detector(frame, classes=[0, 7], verbose=False)
-            
-            for box in results[0].boxes:
-                cls_id = int(box.cls[0])
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+            if frame_idx % 30 == 0:
+                current_annotations = []
                 
-                # 1. Pedestrian Movement (Action: Person outside walkway)
-                if cls_id == 0:
-                    if not self.is_inside_polygon(cx, cy, self.zones["walkway"]):
-                        domain = self._get_schema_domain("Pedestrian Movement")
-                        records.append({
-                            "clip_id": clip_id,
-                            "timestamp": round(timestamp, 2),
-                            "zone": "Floor",
-                            "breached_rule": domain["unsafe_behavior"]["name"],
-                            "description": domain["unsafe_behavior"]["observable_indicator"],
-                            "severity": domain["severity_signal"]
+                # 1. Run the custom classifier on the FULL frame to determine the behavioral state of the room
+                cls_results = self.classifier(frame, verbose=False)
+                top_class = int(cls_results[0].probs.top1)
+                
+                # 2. Run the base detector to find objects for localization
+                det_results = self.detector(frame, classes=[0, 2, 7], verbose=False) # 0=person, 2=car, 7=truck 
+                
+                # Helper to find the largest bounding box for a given class list
+                def get_largest_box(target_classes):
+                    largest_area = 0
+                    best_box = None
+                    for box in det_results[0].boxes:
+                        if int(box.cls[0]) in target_classes:
+                            x1, y1, x2, y2 = map(int, box.xyxy[0])
+                            area = (x2 - x1) * (y2 - y1)
+                            if area > largest_area:
+                                largest_area = area
+                                best_box = (x1, y1, x2, y2)
+                    return best_box
+                    
+                def get_center(box):
+                    if not box: return None
+                    return ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2)
+                    
+                # Class 1: Safe Walkway Violation
+                if top_class == 1:
+                    domain = self._get_schema_domain("Pedestrian Movement")
+                    box = get_largest_box([0])
+                    loc = get_center(box)
+                    zone = f"Zone-X{loc[0]}-Y{loc[1]}" if loc else "Floor"
+                    
+                    if box:
+                        current_annotations.append({
+                            "box": box, "text": f"{domain['severity_signal']}: {domain['unsafe_behavior']['name']}", "color": (0, 0, 255)
                         })
                         
-                # 2. Equipment Interaction (Action: Person in equipment zone -> check vest state)
-                if cls_id == 0:
-                    if self.is_inside_polygon(cx, cy, self.zones["equipment"]):
-                        crop = frame[y1:y2, x1:x2]
-                        # Assume class 1 in custom model is "Unauthorized Intervention" (Red/Black Vest)
-                        if crop.size > 0 and self.check_state(crop, 1):
-                            domain = self._get_schema_domain("Equipment Interaction")
-                            records.append({
-                                "clip_id": clip_id,
-                                "timestamp": round(timestamp, 2),
-                                "zone": "Equipment Zone A",
-                                "breached_rule": domain["unsafe_behavior"]["name"],
-                                "description": domain["unsafe_behavior"]["observable_indicator"],
-                                "severity": domain["severity_signal"]
-                            })
-                            
-                # 3. Forklift Load (Action: Forklift detected -> check load state)
-                if cls_id == 7:
-                    crop = frame[y1:y2, x1:x2]
-                    # Assume class 3 in custom model is "Carrying Overload with Forklift"
-                    if crop.size > 0 and self.check_state(crop, 3):
-                        domain = self._get_schema_domain("Forklift Load")
-                        records.append({
-                            "clip_id": clip_id,
-                            "timestamp": round(timestamp, 2),
-                            "zone": "Transit Route",
-                            "breached_rule": domain["unsafe_behavior"]["name"],
-                            "description": domain["unsafe_behavior"]["observable_indicator"],
-                            "severity": domain["severity_signal"]
-                        })
-                        
-            # 4. Electrical Safety (State-based, fixed panel ROI)
-            if frame_idx % 30 == 0: # Check static state once per second
-                px1, py1 = self.zones["electrical_panel"][0]
-                px2, py2 = self.zones["electrical_panel"][2]
-                panel_crop = frame[py1:py2, px1:px2]
-                # Assume class 2 in custom model is "Opened Panel Cover"
-                if panel_crop.size > 0 and self.check_state(panel_crop, 2):
-                    domain = self._get_schema_domain("Electrical Safety")
                     records.append({
                         "clip_id": clip_id,
                         "timestamp": round(timestamp, 2),
-                        "zone": "Panel Board C",
+                        "zone": zone,
                         "breached_rule": domain["unsafe_behavior"]["name"],
                         "description": domain["unsafe_behavior"]["observable_indicator"],
                         "severity": domain["severity_signal"]
                     })
+                
+                # Class 3: Unauthorized Intervention
+                elif top_class == 3:
+                    domain = self._get_schema_domain("Equipment Interaction")
+                    box = get_largest_box([0])
+                    loc = get_center(box)
+                    zone = f"Equipment Proximity {loc}" if loc else "Equipment Zone"
+                    
+                    if box:
+                        current_annotations.append({
+                            "box": box, "text": f"{domain['severity_signal']}: {domain['unsafe_behavior']['name']}", "color": (0, 0, 255)
+                        })
                         
+                    records.append({
+                        "clip_id": clip_id,
+                        "timestamp": round(timestamp, 2),
+                        "zone": zone,
+                        "breached_rule": domain["unsafe_behavior"]["name"],
+                        "description": domain["unsafe_behavior"]["observable_indicator"],
+                        "severity": domain["severity_signal"]
+                    })
+                    
+                # Class 5: Opened Panel Cover
+                elif top_class == 5:
+                    domain = self._get_schema_domain("Electrical Safety")
+                    
+                    # Assume static panel location for visualization if no explicit box
+                    current_annotations.append({
+                        "box": (1500, 300, 1700, 600), "text": f"{domain['severity_signal']}: {domain['unsafe_behavior']['name']}", "color": (0, 165, 255)
+                    })
+                        
+                    records.append({
+                        "clip_id": clip_id,
+                        "timestamp": round(timestamp, 2),
+                        "zone": "Electrical Panel Board",
+                        "breached_rule": domain["unsafe_behavior"]["name"],
+                        "description": domain["unsafe_behavior"]["observable_indicator"],
+                        "severity": domain["severity_signal"]
+                    })
+                    
+                # Class 7: Carrying Overload with Forklift
+                elif top_class == 7:
+                    domain = self._get_schema_domain("Forklift Load")
+                    box = get_largest_box([2, 7])
+                    loc = get_center(box)
+                    zone = f"Transit Route {loc}" if loc else "Transit Route"
+                    
+                    if box:
+                        current_annotations.append({
+                            "box": box, "text": f"{domain['severity_signal']}: {domain['unsafe_behavior']['name']}", "color": (0, 0, 255)
+                        })
+                        
+                    records.append({
+                        "clip_id": clip_id,
+                        "timestamp": round(timestamp, 2),
+                        "zone": zone,
+                        "breached_rule": domain["unsafe_behavior"]["name"],
+                        "description": domain["unsafe_behavior"]["observable_indicator"],
+                        "severity": domain["severity_signal"]
+                    })
+                    
+            # Draw annotations on the current frame
+            for ann in current_annotations:
+                x1, y1, x2, y2 = ann["box"]
+                cv2.rectangle(frame, (x1, y1), (x2, y2), ann["color"], 4)
+                cv2.putText(frame, ann["text"], (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, ann["color"], 3)
+                
+            out_writer.write(frame)
             frame_idx += 1
             
         cap.release()
+        out_writer.release()
         return records
